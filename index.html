@@ -1,0 +1,110 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>chatpipeline</title><script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script><style>:root{--bg:#0f1117;--card:#181b24;--bd:#2a2f3d;--tx:#e6e8ee;--mut:#8b92a6;--ac:#7c9cff}
+*{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--tx)}
+main{max-width:980px;margin:0 auto;padding:24px 16px 60px}h1{margin:.2em 0}p.sub{color:var(--mut);margin-top:0}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin:14px 0}
+.drop{border:2px dashed var(--bd);border-radius:12px;padding:28px;text-align:center;color:var(--mut);cursor:pointer}
+.drop.over,.drop:hover{border-color:var(--ac);color:var(--tx)}
+button,select,input,textarea{font:inherit;color:var(--tx);background:#10131b;border:1px solid var(--bd);border-radius:8px;padding:8px 12px}
+button{cursor:pointer;background:var(--ac);color:#0b0e16;border:0;font-weight:600}button.sec{background:#222736;color:var(--tx)}
+button:disabled{opacity:.4;cursor:default}input[type=text],input:not([type]),textarea{width:100%}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.mut{color:var(--mut)}.pill{background:#222736;border-radius:99px;padding:2px 10px;font-size:12px;color:var(--mut)}
+.hit{border-top:1px solid var(--bd);padding:10px 0}.hit:first-child{border:0}mark{background:#5a4b00;color:#ffe98a;border-radius:3px}
+table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--bd);padding:6px 8px;text-align:left}
+.note{font-size:13px;color:var(--mut)}canvas{width:100%;background:#0b0d13;border-radius:12px;border:1px solid var(--bd)}
+</style></head><body><main><h1>chatpipeline</h1><p class="sub">One page, whole flow: drop your exports → scrub private details → remove duplicates → stats → one zip (folder per AI, a text file per chat, a JSONL archive and a stats summary). Runs in your browser.</p>
+<div class="card"><div class="drop" id="drop">Drop Claude / ChatGPT exports here (conversations.json or .zip)</div>
+<div class="row" style="margin-top:12px"><label><input type="checkbox" id="s1" checked style="width:auto"> Scrub keys, emails, phones, cards</label><label><input type="checkbox" id="s2" checked style="width:auto"> Remove exact duplicates</label><label><input type="checkbox" id="s3" checked style="width:auto"> Add stats.md</label></div>
+<div class="row" style="margin-top:12px"><button id="go" disabled>Run pipeline & download zip</button></div></div>
+<div class="card"><div id="log" class="note">Waiting for files…</div></div>
+<script>
+/* shared core: parse AI chat exports in the browser (nothing is uploaded) */
+const Chats = (() => {
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  function textOfClaude(m){
+    if (m.text) return m.text;
+    if (Array.isArray(m.content)) return m.content.map(c => c.text || '').join('\n');
+    return '';
+  }
+  function parseData(data, name){
+    const out = [];
+    if (!Array.isArray(data)) data = data && data.conversations ? data.conversations : [data];
+    for (const c of data){
+      if (!c) continue;
+      if (c.chat_messages){ // Claude
+        out.push({id:c.uuid||c.id||name+out.length, title:c.name||'(untitled)', ai:'Claude',
+          created:c.created_at||'', messages:c.chat_messages.map(m=>({role:m.sender==='human'?'user':'assistant', text:textOfClaude(m)})).filter(m=>m.text)});
+      } else if (c.mapping){ // ChatGPT
+        const msgs = Object.values(c.mapping).map(n=>n.message).filter(m=>m&&m.content&&m.author&&m.author.role!=='system'&&m.author.role!=='tool')
+          .sort((a,b)=>(a.create_time||0)-(b.create_time||0))
+          .map(m=>({role:m.author.role, text:(m.content.parts||[]).filter(p=>typeof p==='string').join('\n')})).filter(m=>m.text.trim());
+        out.push({id:c.conversation_id||c.id||name+out.length, title:c.title||'(untitled)', ai:'ChatGPT',
+          created:c.create_time?new Date(c.create_time*1000).toISOString():'', messages:msgs});
+      } else if (Array.isArray(c.messages)){ // generic
+        out.push({id:c.id||name+out.length, title:c.title||c.name||'(untitled)', ai:c.ai||c.source||'Other',
+          created:c.created||c.created_at||'', messages:c.messages.map(m=>({role:m.role||(m.sender==='human'?'user':'assistant'), text:m.text||m.content||''})).filter(m=>m.text)});
+      }
+    }
+    return out;
+  }
+  async function loadFiles(fileList){
+    let all = [];
+    for (const f of fileList){
+      if (/\.zip$/i.test(f.name) && window.JSZip){
+        const z = await JSZip.loadAsync(f);
+        for (const [n, e] of Object.entries(z.files)){
+          if (!e.dir && /\.json$/i.test(n) && /conversation|chat/i.test(n)){
+            try { all = all.concat(parseData(JSON.parse(await e.async('string')), n)); } catch(_){}
+          }
+        }
+      } else if (/\.jsonl$/i.test(f.name)){
+        const lines = (await f.text()).split('\n').filter(Boolean);
+        try { all = all.concat(parseData(lines.map(l=>JSON.parse(l)), f.name)); } catch(_){}
+      } else {
+        try { all = all.concat(parseData(JSON.parse(await f.text()), f.name)); } catch(_){}
+      }
+    }
+    return all;
+  }
+  const fullText = c => c.messages.map(m=>m.text).join('\n');
+  const STOP = new Set('the a an and or but if of to in on at for with from by is are was were be been it this that these those i you he she we they me my your our their as not no so do does did can could would should will just have has had about into than then there what which who how when why also more some any all one'.split(' '));
+  const tokens = s => (s.toLowerCase().match(/[a-z0-9À-ɏͰ-Ͽ]{2,}/g)||[]).filter(w=>!STOP.has(w));
+  function download(name, content, type){
+    const b = content instanceof Blob ? content : new Blob([content], {type: type||'text/plain'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = name; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+  }
+  const PATTERNS = [
+    [/sk-[A-Za-z0-9_\-]{20,}/g,'[API_KEY]'],[/AIza[0-9A-Za-z_\-]{30,}/g,'[API_KEY]'],[/gh[pousr]_[A-Za-z0-9]{30,}/g,'[GITHUB_TOKEN]'],
+    [/AKIA[0-9A-Z]{16}/g,'[AWS_KEY]'],[/[\w.+-]+@[\w-]+\.[\w.-]+/g,'[EMAIL]'],[/\bhttps?:\/\/[^\s)]+/g,m=>m],
+    [/(?<!\d)\+?\d[\d\s().-]{8,}\d(?!\d)/g,'[PHONE]'],[/\b(?:\d[ -]*?){13,16}\b/g,'[CARD]']
+  ];
+  const scrub = s => PATTERNS.reduce((t,[re,r])=>t.replace(re,r), s);
+  return {esc, parseData, loadFiles, fullText, tokens, download, scrub};
+})();
+const $ = s => document.querySelector(s);
+function dropzone(el, cb){
+  el.addEventListener('dragover', e=>{e.preventDefault(); el.classList.add('over');});
+  el.addEventListener('dragleave', ()=>el.classList.remove('over'));
+  el.addEventListener('drop', e=>{e.preventDefault(); el.classList.remove('over'); cb(e.dataTransfer.files);});
+  const inp = document.createElement('input'); inp.type='file'; inp.multiple=true; inp.hidden=true; inp.accept='.json,.jsonl,.zip';
+  el.after(inp); el.addEventListener('click', ()=>inp.click()); inp.addEventListener('change', ()=>cb(inp.files));
+}
+
+
+let docs=[];const log=t=>$('#log').innerHTML+='<br>'+t;
+const safe=s=>s.replace(/[\\/:*?"<>|]/g,'_').replace(/\s+/g,' ').trim().slice(0,70)||'untitled';
+dropzone($('#drop'),async fl=>{$('#log').textContent='Reading…';docs=await Chats.loadFiles(fl);$('#log').textContent=`Loaded ${docs.length} chats from ${[...new Set(docs.map(d=>d.ai))].join(', ')||'?'}.`;$('#go').disabled=!docs.length});
+$('#go').onclick=async()=>{
+  let d=docs.map(x=>({...x,messages:x.messages.map(m=>({...m}))}));
+  if($('#s1').checked){let n=0;d.forEach(c=>c.messages.forEach(m=>{const t=Chats.scrub(m.text);if(t!==m.text)n++;m.text=t}));log(`Scrub: cleaned ${n} messages.`)}
+  if($('#s2').checked){const seen=new Set(),b=d.length;d=d.filter(c=>{const k=c.ai+'|'+Chats.fullText(c).slice(0,2000);if(seen.has(k))return false;seen.add(k);return true});log(`Dedupe: removed ${b-d.length} exact duplicates.`)}
+  const z=new JSZip();let jl='';const per={};
+  d.forEach((c,i)=>{const dt=(c.created||'').slice(0,10)||'undated';z.folder(c.ai).file(`${dt} ${safe(c.title)} ${i}.txt`,`${c.title}\n${c.ai} · ${dt}\n\n`+c.messages.map(m=>`${m.role==='user'?'ME':c.ai.toUpperCase()}: ${m.text}`).join('\n\n'));
+    jl+=JSON.stringify(c)+'\n';const p=per[c.ai]=per[c.ai]||{chats:0,msgs:0,words:0};p.chats++;p.msgs+=c.messages.length;p.words+=Chats.fullText(c).split(/\s+/).length});
+  z.file('archive.jsonl',jl);
+  if($('#s3').checked){const months={};d.forEach(c=>{const m=(c.created||'').slice(0,7)||'undated';months[m]=(months[m]||0)+1});
+    z.file('stats.md','# Stats\n\n| AI | Chats | Messages | Words | ~Tokens |\n|---|---|---|---|---|\n'+Object.entries(per).map(([a,p])=>`| ${a} | ${p.chats} | ${p.msgs} | ${p.words} | ${Math.round(p.words*1.33)} |`).join('\n')+'\n\n## Chats per month\n'+Object.entries(months).sort().map(([m,n])=>`- ${m}: ${n}`).join('\n'))}
+  log(`Packed ${d.length} chats.`);Chats.download('chatpipeline.zip',await z.generateAsync({type:'blob'}));log('Done ✔');
+};
+</script>
+</main></body></html>
